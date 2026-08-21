@@ -601,10 +601,8 @@ class HonchoClientConfig:
             or raw.get("environment", "production")
         )
 
-        # The Honcho SDK's native config format — and what Claude Desktop
-        # writes — nests the URL at endpoint.baseUrl. Read it first: a user
-        # who has that block set almost certainly means it, and the flat
-        # baseUrl / base_url keys below are the Hermes-specific spelling.
+        # An explicit process environment wins so isolated acceptance and
+        # emergency routing cannot be shadowed by a stored cloud endpoint.
         endpoint_block = raw.get("endpoint")
         native_base_url = (
             endpoint_block.get("baseUrl")
@@ -612,13 +610,13 @@ class HonchoClientConfig:
             else None
         )
         base_url = _sanitize_url(
-            host_block.get("baseUrl")
+            os.environ.get("HONCHO_BASE_URL", "").strip()
+            or os.environ.get("HONCHO_URL", "").strip()
+            or host_block.get("baseUrl")
             or host_block.get("base_url")
             or native_base_url
             or raw.get("baseUrl")
             or raw.get("base_url")
-            or os.environ.get("HONCHO_BASE_URL", "").strip()
-            or os.environ.get("HONCHO_URL", "").strip()
             or None
         )
         # Host config wins over flat/global config and environment.

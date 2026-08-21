@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
 from plugins.memory.honcho.client import spawn_context_thread
+from plugins.memory.honcho.safety import contains_secret, safe_exchange
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -729,7 +730,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Returns empty in tools-only mode and respects the configured injection
         frequency and context budget.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or contains_secret(query):
             return ""
 
         # Tools-only mode has no automatic injection.
@@ -963,7 +964,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         Context and dialectic refreshes have independent cadence controls.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or contains_secret(query):
             return
         # Tools-only mode has no automatic prefetch.
         if self._recall_mode == "tools":
@@ -1432,12 +1433,13 @@ class HonchoMemoryProvider(MemoryProvider):
         msg_limit = self._config.message_max_chars if self._config else 25000
         clean_user_content = sanitize_context(user_content or "").strip()
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
-        # Skip only when the whole turn is empty. An interrupted or tool-only
-        # turn can legitimately have an empty assistant side; the user's
-        # message must still be persisted (the manager already drops
-        # empty-user turns upstream). Empty sides are skipped per-loop below
-        # so we never write empty-string messages either.
+        # Interrupted or tool-only turns can have an empty assistant side, so
+        # skip only fully empty turns. Reject the complete turn when either
+        # non-empty side contains a credential.
         if not clean_user_content and not clean_assistant_content:
+            return
+        if not safe_exchange(clean_user_content, clean_assistant_content):
+            logger.warning("Honcho skipped an unsafe or low-value exchange")
             return
 
         def _sync():
@@ -1476,6 +1478,9 @@ class HonchoMemoryProvider(MemoryProvider):
         stays focused on the 7-PR consolidation and its review follow-ups.
         """
         if action != "add" or target != "user" or not content:
+            return
+        if contains_secret(content):
+            logger.warning("Honcho skipped a secret-bearing memory write")
             return
         if self._cron_skipped:
             return
@@ -1553,6 +1558,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 peer = args.get("peer", "user")
                 card_update = args.get("card")
                 if card_update:
+                    if contains_secret(json.dumps(card_update)):
+                        return tool_error("Peer card contains a credential or secret.")
                     result = self._manager.set_peer_card(self._session_key, card_update, peer=peer)
                     if result is None:
                         return tool_error("Failed to update peer card.")
@@ -1566,6 +1573,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 query = (args.get("query") or "").strip()
                 if not query:
                     return tool_error("Missing required parameter: query")
+                if contains_secret(query):
+                    return tool_error("Query contains a credential or secret.")
                 max_tokens = min(int(args.get("max_tokens", 800)), 2000)
                 peer = args.get("peer", "user")
                 result = self._manager.search_context(
@@ -1579,6 +1588,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 query = (args.get("query") or "").strip()
                 if not query:
                     return tool_error("Missing required parameter: query")
+                if contains_secret(query):
+                    return tool_error("Query contains a credential or secret.")
                 peer = args.get("peer", "user")
                 reasoning_level = args.get("reasoning_level")
                 try:
@@ -1645,6 +1656,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 query = (args.get("query") or "").strip()
                 if query and not list_mode:
                     return tool_error("query is only valid when list is true.")
+                if query and contains_secret(query):
+                    return tool_error("Query contains a credential or secret.")
 
                 if list_mode:
                     conclusions = self._manager.list_conclusions(
@@ -1656,6 +1669,8 @@ class HonchoMemoryProvider(MemoryProvider):
                     if ok:
                         return json.dumps({"result": f"Conclusion {delete_id} deleted."})
                     return tool_error(f"Failed to delete conclusion {delete_id}.")
+                if contains_secret(conclusion):
+                    return tool_error("Conclusion contains a credential or secret.")
                 ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
                 if ok:
                     return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})

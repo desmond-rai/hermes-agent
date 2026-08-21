@@ -118,6 +118,29 @@ class TestManagerCacheOps:
         assert "test" not in mgr._cache
 
 
+    def test_flush_skips_only_secret_messages_and_keeps_safe_pending_messages(self):
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="test", user_peer_id="u", assistant_peer_id="a", honcho_session_id="s"
+        )
+        session.add_message("user", "safe question")
+        session.add_message("assistant", "safe answer")
+        session.add_message("user", "glpat-abcdefghijklmnopqrst")
+        remote = MagicMock()
+        user = MagicMock()
+        assistant = MagicMock()
+        user.message.side_effect = lambda content: ("user", content)
+        assistant.message.side_effect = lambda content: ("assistant", content)
+        mgr._sessions_cache["s"] = remote
+        mgr._get_or_create_peer = MagicMock(side_effect=[user, assistant])
+
+        assert mgr._flush_session(session) is True
+
+        remote.add_messages.assert_called_once_with(
+            [("user", "safe question"), ("assistant", "safe answer")]
+        )
+        assert all(message.get("_synced") for message in session.messages)
+
     def test_list_sessions(self):
         mgr = HonchoSessionManager()
         s1 = HonchoSession(key="k1", user_peer_id="u", assistant_peer_id="a", honcho_session_id="s1")
@@ -198,6 +221,14 @@ class TestPeerLookupHelpers:
             "session_id": session.honcho_session_id,
         }])
 
+    def test_conclusion_and_peer_card_writes_reject_secrets(self):
+        mgr, session = self._make_cached_manager()
+        mgr._get_or_create_peer = MagicMock()
+
+        assert mgr.create_conclusion(session.key, "password=credentialvalue123") is False
+        assert mgr.set_peer_card(session.key, ["xox" + "b-123456789012-abcdefghijklmnopqrstuvwxyz"]) is None
+        mgr._get_or_create_peer.assert_not_called()
+
 
 class TestConcludeToolDispatch:
     def test_conclude_schema_has_no_anyof(self):
@@ -265,6 +296,81 @@ class TestConcludeToolDispatch:
 
         assert session.add_message.call_args_list[0].args == ("user", "hello")
         assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
+
+    def test_sync_turn_rejects_complete_exchange_when_either_side_contains_a_secret(self):
+        for user_text, assistant_text in (
+            ("api_key=credentialvalue123", "done"),
+            ("hello", "Authorization: Bearer secretvalue123"),
+            ("hello", "-----BEGIN PRIVATE KEY-----\nsecret"),
+            ("HONCHO_TEST_HERMES_123 Reply exactly: OK", "OK"),
+        ):
+            provider = HonchoMemoryProvider()
+            provider._session_key = "telegram:123"
+            provider._manager = MagicMock()
+            provider._cron_skipped = False
+            provider._config = SimpleNamespace(message_max_chars=25000)
+
+            provider.sync_turn(user_text, assistant_text)
+
+            provider._manager.get_or_create.assert_not_called()
+            assert provider._sync_thread is None
+
+    def test_sync_turn_keeps_non_secret_discussion_about_credentials(self):
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
+
+        provider.sync_turn("Please rotate the API key", "The credential needs rotation")
+        provider._sync_thread.join(timeout=1.0)
+
+        assert session.add_message.call_count == 2
+
+    def test_prefetch_and_query_tools_reject_secrets_before_honcho_calls(self):
+        provider = HonchoMemoryProvider()
+        provider._session_initialized = True
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._recall_mode = "hybrid"
+
+        assert provider.prefetch("Authorization: Bearer secretvalue123") == ""
+        result = provider.handle_tool_call(
+            "honcho_search", {"query": "glpat-abcdefghijklmnopqrst"}
+        )
+
+        provider._manager.get_prefetch_context.assert_not_called()
+        provider._manager.search_context.assert_not_called()
+        assert "credential or secret" in result
+
+    def test_memory_mirror_and_write_tools_reject_secrets(self):
+        provider = HonchoMemoryProvider()
+        provider._session_initialized = True
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._recall_mode = "hybrid"
+
+        provider.on_memory_write("add", "user", "aws_session_token=longtemporarycredential")
+        conclusion = provider.handle_tool_call(
+            "honcho_conclude", {"conclusion": "password=credentialvalue123"}
+        )
+        card = provider.handle_tool_call(
+            "honcho_profile", {"card": ["AKIAIOSFODNN7EXAMPLE"]}
+        )
+        listed = provider.handle_tool_call(
+            "honcho_conclude", {"list": True, "query": "glpat-abcdefghijklmnopqrst"}
+        )
+
+        provider._manager.create_conclusion.assert_not_called()
+        provider._manager.set_peer_card.assert_not_called()
+        provider._manager.list_conclusions.assert_not_called()
+        assert "credential or secret" in conclusion
+        assert "credential or secret" in card
+        assert "credential or secret" in listed
 
 
 # ---------------------------------------------------------------------------

@@ -94,6 +94,18 @@ def test_save_config_sets_owner_only_permissions(tmp_path, monkeypatch):
 
 class TestLatencyFlagResolution:
 
+    def test_environment_base_url_overrides_stored_endpoint(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HONCHO_BASE_URL", "http://127.0.0.1:1")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k",
+            "baseUrl": "https://api.honcho.dev",
+        }))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.base_url == "http://127.0.0.1:1"
+
     def test_host_block_wins(self, tmp_path, monkeypatch):
         monkeypatch.delenv('HONCHO_BASE_URL', raising=False)
         config_path = tmp_path / 'config.json'

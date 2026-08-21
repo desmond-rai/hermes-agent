@@ -14,6 +14,7 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from plugins.memory.honcho.client import get_honcho_client, spawn_context_thread
 from plugins.memory.honcho.oauth import redact_tokens as _redact_tokens
+from plugins.memory.honcho.safety import contains_secret
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -665,6 +666,16 @@ class HonchoSessionManager:
         new_messages = [m for m in session.messages if not m.get("_synced")]
         if not new_messages:
             return True
+        safe_messages = []
+        for message in new_messages:
+            if contains_secret(str(message.get("content") or "")):
+                logger.warning("Honcho skipped a secret-bearing message")
+                message["_synced"] = True
+            else:
+                safe_messages.append(message)
+        new_messages = safe_messages
+        if not new_messages:
+            return True
 
         # Resolved inside the operation so a retry after a client rebuild gets fresh objects.
         def _sync_messages() -> int:
@@ -909,6 +920,9 @@ class HonchoSessionManager:
         if target_peer_id is None:
             return ""
 
+        if contains_secret(query):
+            return ""
+
         # Guard: truncate query to Honcho's dialectic input limit
         if len(query) > self._dialectic_max_input_chars:
             query = query[:self._dialectic_max_input_chars].rsplit(" ", 1)[0]
@@ -1005,6 +1019,8 @@ class HonchoSessionManager:
         session = self._cache.get(session_key)
         if not session:
             return {}
+        if user_message and contains_secret(user_message):
+            return {}
 
         result: dict[str, str] = {}
 
@@ -1071,6 +1087,9 @@ class HonchoSessionManager:
             return False
 
         content_bytes = self._format_migration_transcript(session_key, messages)
+        if contains_secret(content_bytes.decode("utf-8", errors="replace")):
+            logger.warning("Honcho skipped secret-bearing local history migration")
+            return False
         first_ts = messages[0].get("timestamp") if messages else None
 
         try:
@@ -1213,6 +1232,9 @@ class HonchoSessionManager:
                 continue
             content = filepath.read_text(encoding="utf-8").strip()
             if not content:
+                continue
+            if contains_secret(content):
+                logger.warning("Honcho skipped secret-bearing memory file: %s", filename)
                 continue
 
             wrapped = (
@@ -1497,7 +1519,7 @@ class HonchoSessionManager:
 
         # Honcho caps query length for the embedding model; keep well under it.
         q = (query or "").strip()
-        if not q:
+        if not q or contains_secret(q):
             return ""
         if len(q) > 4000:
             q = q[:4000]
@@ -1596,7 +1618,7 @@ class HonchoSessionManager:
         Returns:
             True on success, False on failure.
         """
-        if not content or not content.strip():
+        if not content or not content.strip() or contains_secret(content):
             return False
 
         session = self._cache.get(session_key)
@@ -1704,6 +1726,8 @@ class HonchoSessionManager:
         Returns:
             Updated card on success, None on failure.
         """
+        if any(contains_secret(str(fact)) for fact in card):
+            return None
         session = self._cache.get(session_key)
         if not session:
             return None
@@ -1749,7 +1773,7 @@ class HonchoSessionManager:
         Returns:
             True on success, False on failure.
         """
-        if not content or not content.strip():
+        if not content or not content.strip() or contains_secret(content):
             return False
 
         session = self._cache.get(session_key)
